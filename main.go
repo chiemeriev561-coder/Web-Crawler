@@ -89,7 +89,7 @@ func (c *Crawler) Crawl(startURL string) {
 
 	// Load previous state if available
 	if c.stateFile != "" {
-		c.loadState(startURL)
+		c.loadState()
 	}
 
 	// start workers
@@ -459,7 +459,7 @@ func (c *Crawler) saveState() error {
 		case url := <-c.queue:
 			state.PendingURLs = append(state.PendingURLs, url)
 		default:
-			break
+			// Queue is empty, stop draining
 		}
 	}
 
@@ -479,7 +479,7 @@ func (c *Crawler) saveState() error {
 	return encoder.Encode(state)
 }
 
-func (c *Crawler) loadState(startURL string) error {
+func (c *Crawler) loadState() error {
 	if c.stateFile == "" {
 		return nil
 	}
