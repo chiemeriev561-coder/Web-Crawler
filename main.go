@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,6 +63,9 @@ type Crawler struct {
 	queueFullCount int
 	startTime      time.Time
 	stateFile      string
+	client         *http.Client
+	pending        map[string]struct{}
+	pendingMu      sync.RWMutex
 }
 
 func NewCrawler(concurrency int, delay time.Duration, domain string, outputDir string, saveContent bool, saveRawHTML bool, stateFile string) *Crawler {
@@ -80,6 +85,8 @@ func NewCrawler(concurrency int, delay time.Duration, domain string, outputDir s
 		saveContent: saveContent,
 		saveRawHTML: saveRawHTML,
 		stateFile:   stateFile,
+		client:      &http.Client{Timeout: 10 * time.Second},
+		pending:     make(map[string]struct{}),
 	}
 }
 
@@ -87,21 +94,20 @@ func (c *Crawler) Crawl(startURL string) {
 	c.startTime = time.Now()
 	c.stats.StartTime = c.startTime
 
-	// Load previous state if available
-	if c.stateFile != "" {
-		c.loadState()
-	}
-
 	// start workers
 	for i := 0; i < c.concurrency; i++ {
 		go c.worker()
 	}
 
-	// Add starting url to queue if not already visited
-	if !c.isVisited(startURL) {
-		c.wg.Add(1)
-		c.queue <- startURL
+	// Load previous state if available
+	if c.stateFile != "" {
+		if err := c.loadState(); err != nil {
+			fmt.Printf("Error loading state: %v\n", err)
+		}
 	}
+
+	// Add starting url to queue if not already visited
+	c.scheduleURL(startURL)
 
 	// wait for all workers to finish
 	c.wg.Wait()
@@ -122,23 +128,15 @@ func (c *Crawler) worker() {
 
 		//fetch and parse the page
 		c.processPage(jobURL)
+		c.markCompleted(jobURL)
 		c.wg.Done()
 	}
 }
 
 func (c *Crawler) processPage(pageURL string) {
-	// check if already visited
-	if c.isVisited(pageURL) {
-		return
-	}
-
-	// Mark as visited
-	c.markVisited(pageURL)
-
 	fmt.Printf("Crawling :%s\n", pageURL)
 
 	// fetch the page with timeout and user-agent
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", pageURL, nil)
 	if err != nil {
 		fmt.Printf("Error creating request for %s: %v\n", pageURL, err)
@@ -146,7 +144,7 @@ func (c *Crawler) processPage(pageURL string) {
 		return
 	}
 	req.Header.Set("User-Agent", "GoCrawler/1.0")
-	resp, err := client.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		fmt.Printf("Error fetching %s: %v\n", pageURL, err)
 		c.incrementFailedPages()
@@ -168,29 +166,9 @@ func (c *Crawler) processPage(pageURL string) {
 	c.pages = append(c.pages, pageData)
 	c.pagesMu.Unlock()
 
-	// parse HTML and extract links from the already extracted data
-
-	//Add new links to the queue
+	// Add new links to the queue
 	for _, link := range links {
-		if c.isVisited(link) {
-			continue
-		}
-		u, err := url.Parse(link)
-		if err != nil {
-			continue
-		}
-		if !strings.Contains(u.Hostname(), c.domain) {
-			continue
-		}
-		c.wg.Add(1)
-		select {
-		case c.queue <- link:
-			// added to queue
-		default:
-			fmt.Printf("Queue full, skipping %s\n", link)
-			c.queueFullCount++
-			c.wg.Done()
-		}
+		c.scheduleURL(link)
 	}
 }
 
@@ -215,7 +193,7 @@ func (c *Crawler) extractPageData(resp *http.Response, pageURL string, contentTy
 	}
 
 	// Parse HTML for metadata and content
-	doc, err := html.Parse(strings.NewReader(string(bodyBytes)))
+	doc, err := html.Parse(bytes.NewReader(bodyBytes))
 	if err != nil {
 		fmt.Printf("Error parsing HTML for %s: %v\n", pageURL, err)
 		return pageData, []string{}
@@ -344,6 +322,42 @@ func (c *Crawler) normalizeURL(href, baseURL string) string {
 	return resolved.String()
 }
 
+func (c *Crawler) scheduleURL(pageURL string) bool {
+	if pageURL == "" {
+		return false
+	}
+
+	u, err := url.Parse(pageURL)
+	if err != nil {
+		return false
+	}
+	if !c.isAllowedHostname(u.Hostname()) {
+		return false
+	}
+
+	c.visitedMu.Lock()
+	if c.visited[pageURL] {
+		c.visitedMu.Unlock()
+		return false
+	}
+	c.visited[pageURL] = true
+	c.visitedMu.Unlock()
+
+	c.addPending(pageURL)
+	c.wg.Add(1)
+	c.queue <- pageURL
+	return true
+}
+
+func (c *Crawler) isAllowedHostname(hostname string) bool {
+	if hostname == "" {
+		return false
+	}
+	hostname = strings.ToLower(hostname)
+	domain := strings.ToLower(c.domain)
+	return hostname == domain || strings.HasSuffix(hostname, "."+domain)
+}
+
 func (c *Crawler) isVisited(url string) bool {
 	c.visitedMu.RLock()
 	defer c.visitedMu.RUnlock()
@@ -354,6 +368,29 @@ func (c *Crawler) markVisited(url string) {
 	c.visitedMu.Lock()
 	defer c.visitedMu.Unlock()
 	c.visited[url] = true
+}
+
+func (c *Crawler) addPending(pageURL string) {
+	c.pendingMu.Lock()
+	c.pending[pageURL] = struct{}{}
+	c.pendingMu.Unlock()
+}
+
+func (c *Crawler) markCompleted(pageURL string) {
+	c.pendingMu.Lock()
+	delete(c.pending, pageURL)
+	c.pendingMu.Unlock()
+}
+
+func (c *Crawler) snapshotPending() []string {
+	c.pendingMu.RLock()
+	defer c.pendingMu.RUnlock()
+
+	pending := make([]string, 0, len(c.pending))
+	for pageURL := range c.pending {
+		pending = append(pending, pageURL)
+	}
+	return pending
 }
 
 // Export functionality
@@ -416,7 +453,8 @@ func (c *Crawler) ExportToCSV(filename string) error {
 		}
 	}
 
-	return nil
+	writer.Flush()
+	return writer.Error()
 }
 
 func (c *Crawler) ExportStats(filename string) error {
@@ -441,31 +479,16 @@ func (c *Crawler) saveState() error {
 	}
 
 	c.visitedMu.RLock()
-	defer c.visitedMu.RUnlock()
+	visited := make([]string, 0, len(c.visited))
+	for pageURL := range c.visited {
+		visited = append(visited, pageURL)
+	}
+	c.visitedMu.RUnlock()
 
 	state := CrawlState{
-		VisitedURLs: make([]string, 0, len(c.visited)),
-		PendingURLs: make([]string, 0),
+		VisitedURLs: visited,
+		PendingURLs: c.snapshotPending(),
 		Timestamp:   time.Now(),
-	}
-
-	for url := range c.visited {
-		state.VisitedURLs = append(state.VisitedURLs, url)
-	}
-
-	// Get pending URLs from queue (this is approximate as queue is being processed)
-	for len(c.queue) > 0 {
-		select {
-		case url := <-c.queue:
-			state.PendingURLs = append(state.PendingURLs, url)
-		default:
-			// Queue is empty, stop draining
-		}
-	}
-
-	// Put pending URLs back into queue
-	for _, url := range state.PendingURLs {
-		c.queue <- url
 	}
 
 	file, err := os.Create(c.stateFile)
@@ -499,10 +522,28 @@ func (c *Crawler) loadState() error {
 
 	// Restore visited URLs
 	c.visitedMu.Lock()
-	for _, url := range state.VisitedURLs {
-		c.visited[url] = true
+	for _, pageURL := range state.VisitedURLs {
+		c.visited[pageURL] = true
 	}
 	c.visitedMu.Unlock()
+
+	for _, pageURL := range state.PendingURLs {
+		if pageURL == "" {
+			continue
+		}
+		u, err := url.Parse(pageURL)
+		if err != nil || !c.isAllowedHostname(u.Hostname()) {
+			continue
+		}
+		c.visitedMu.Lock()
+		if !c.visited[pageURL] {
+			c.visited[pageURL] = true
+		}
+		c.visitedMu.Unlock()
+		c.addPending(pageURL)
+		c.wg.Add(1)
+		c.queue <- pageURL
+	}
 
 	fmt.Printf("Loaded state: %d visited URLs, %d pending URLs\n", len(state.VisitedURLs), len(state.PendingURLs))
 
@@ -510,25 +551,36 @@ func (c *Crawler) loadState() error {
 }
 
 func main() {
-	start := "https://cine-craft-box.lovable.app/"
-	if len(os.Args) > 1 {
-		start = os.Args[1]
-		// Clean the URL by removing brackets and extra whitespace
-		start = strings.TrimSpace(start)
-		start = strings.Trim(start, "[]")
+	defaultStart := "https://cine-craft-box.lovable.app/"
+	startFlag := flag.String("start-url", defaultStart, "Starting URL for the crawl")
+	concurrencyFlag := flag.Int("concurrency", 5, "Number of concurrent workers")
+	delayFlag := flag.Duration("delay", 100*time.Millisecond, "Delay between requests")
+	outputDirFlag := flag.String("output-dir", "./crawl_output", "Directory for exported crawl results")
+	saveContentFlag := flag.Bool("save-content", true, "Save extracted text content")
+	saveRawHTMLFlag := flag.Bool("save-raw-html", false, "Save raw HTML for each crawled page")
+	stateFileFlag := flag.String("state-file", "./crawl_state.json", "File used to persist crawl state")
+	flag.Parse()
+
+	start := *startFlag
+	if args := flag.Args(); len(args) > 0 {
+		start = args[0]
 	}
+	// Clean the URL by removing brackets and extra whitespace.
+	start = strings.TrimSpace(start)
+	start = strings.Trim(start, "[]")
+
 	u, err := url.Parse(start)
 	if err != nil {
 		fmt.Printf("Invalid start URL: %v\n", err)
 		return
 	}
-	domain := u.Hostname()
+	domain := strings.ToLower(u.Hostname())
 
 	// Configuration
-	outputDir := "./crawl_output"
-	saveContent := true
-	saveRawHTML := false
-	stateFile := "./crawl_state.json"
+	outputDir := *outputDirFlag
+	saveContent := *saveContentFlag
+	saveRawHTML := *saveRawHTMLFlag
+	stateFile := *stateFileFlag
 
 	// Create output directory
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -537,9 +589,9 @@ func main() {
 	}
 
 	crawler := NewCrawler(
-		5,                    // 5 concurrent workers
-		100*time.Millisecond, // 100ms delay between requests
-		domain,               // only crawl this domain
+		*concurrencyFlag,
+		*delayFlag,
+		domain,
 		outputDir,
 		saveContent,
 		saveRawHTML,

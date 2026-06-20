@@ -27,16 +27,16 @@ A concurrent web crawler written in Go with comprehensive data storage and expor
 - Run directly:
 
   ```bash
-  go run main.go <start-url>
+  go run main.go [flags] [start-url]
   ```
 
-  Example: `go run main.go https://example.com`
+  Example: `go run main.go -concurrency 8 -delay 200ms https://example.com`
 
 - Build binary:
 
   ```bash
   go build -o crawler
-  ./crawler https://example.com
+  ./crawler -output-dir ./crawl_output https://example.com
   ```
 
 ## Defaults
@@ -83,20 +83,17 @@ Persistent state for resuming interrupted crawls:
 
 ## Behavior and Limits
 
-- The crawler only follows links whose hostname contains the start URL's hostname
+- The crawler only follows links whose hostname matches the start URL's hostname or a subdomain
 - It does NOT yet respect robots.txt, sitemaps, or crawl-delay directives — use responsibly
 - No depth limit currently implemented (may crawl indefinitely on large sites)
 - Visited URLs are kept in-memory during crawling, but state is persisted for resuming
 
 ## Configuration
 
-The crawler's behavior can be customized by modifying the configuration variables in the `main()` function:
+The crawler's behavior can be customized with command-line flags:
 
-```go
-outputDir := "./crawl_output"    // Output directory for results
-saveContent := true              // Save extracted text content
-saveRawHTML := false             // Save raw HTML content
-stateFile := "./crawl_state.json" // State file for resuming crawls
+```bash
+go run main.go   -start-url https://example.com   -concurrency 8   -delay 200ms   -output-dir ./crawl_output   -save-content=true   -save-raw-html=false   -state-file ./crawl_state.json
 ```
 
 ## Future Improvements
@@ -105,7 +102,6 @@ stateFile := "./crawl_state.json" // State file for resuming crawls
 - Add configurable depth limit
 - Add rate limiting per-host (more sophisticated than fixed delay)
 - Parse and respect sitemaps
-- Add command-line flags for configuration
 - Support for authentication/cookies
 - Headless browser support for JavaScript-rendered content
 - Distributed crawling support
