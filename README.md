@@ -24,16 +24,22 @@ A concurrent web crawler written in Go with comprehensive data storage and expor
 
 ## Build & Run
 
-- Run directly:
+- **Run in Interactive Terminal Menu Mode (TUI)**:
+  Running the crawler without any positional arguments or explicitly passing the `-interactive` flag starts an interactive CLI menu:
+  ```bash
+  go run main.go
+  # or
+  go run main.go -interactive
+  ```
+  This interactive menu allows you to input any website URL, set concurrency, delay, max depth, max pages, and more.
 
+- **Run directly (CLI Mode)**:
   ```bash
   go run main.go [flags] [start-url]
   ```
-
   Example: `go run main.go -concurrency 8 -delay 200ms https://example.com`
 
-- Build binary:
-
+- **Build binary**:
   ```bash
   go build -o crawler
   ./crawler -output-dir ./crawl_output https://example.com
@@ -49,6 +55,8 @@ A concurrent web crawler written in Go with comprehensive data storage and expor
 - **Content saving**: Enabled (text content)
 - **Raw HTML saving**: Disabled
 - **State file**: `./crawl_state.json`
+- **Default max depth**: 0 (Unlimited)
+- **Default max pages**: 0 (Unlimited)
 
 ## Output Files
 
@@ -93,7 +101,16 @@ Persistent state for resuming interrupted crawls:
 The crawler's behavior can be customized with command-line flags:
 
 ```bash
-go run main.go   -start-url https://example.com   -concurrency 8   -delay 200ms   -output-dir ./crawl_output   -save-content=true   -save-raw-html=false   -state-file ./crawl_state.json
+go run main.go \
+  -start-url https://example.com \
+  -concurrency 8 \
+  -delay 200ms \
+  -output-dir ./crawl_output \
+  -save-content=true \
+  -save-raw-html=false \
+  -state-file ./crawl_state.json \
+  -max-depth 3 \
+  -max-pages 100
 ```
 
 ## Future Improvements

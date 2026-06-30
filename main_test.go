@@ -111,3 +111,17 @@ func TestLoadState(t *testing.T) {
 		t.Fatal("pending URL was not restored into visited set")
 	}
 }
+
+func TestMaxPagesLimit(t *testing.T) {
+	crawler := NewCrawler(1, 0, "example.com", t.TempDir(), false, false, "")
+	crawler.maxPages = 2
+
+	// Simulate 2 pages already successfully crawled and stored
+	crawler.pages = append(crawler.pages, PageData{URL: "https://example.com/1"})
+	crawler.pages = append(crawler.pages, PageData{URL: "https://example.com/2"})
+
+	// Scheduling another URL should now return false since we reached maxPages
+	if crawler.scheduleURL("https://example.com/3") {
+		t.Fatal("scheduleURL accepted a URL after maxPages limit was reached")
+	}
+}

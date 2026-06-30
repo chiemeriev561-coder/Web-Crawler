@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
@@ -40,9 +41,10 @@ type CrawlStats struct {
 }
 
 type CrawlState struct {
-	VisitedURLs []string  `json:"visited_urls"`
-	PendingURLs []string  `json:"pending_urls"`
-	Timestamp   time.Time `json:"timestamp"`
+	VisitedURLs []string       `json:"visited_urls"`
+	PendingURLs []string       `json:"pending_urls"`
+	Timestamp   time.Time      `json:"timestamp"`
+	URLDepths   map[string]int `json:"url_depths,omitempty"`
 }
 
 type Crawler struct {
@@ -66,6 +68,10 @@ type Crawler struct {
 	client         *http.Client
 	pending        map[string]struct{}
 	pendingMu      sync.RWMutex
+	depths         map[string]int
+	depthsMu       sync.RWMutex
+	maxDepth       int
+	maxPages       int
 }
 
 func NewCrawler(concurrency int, delay time.Duration, domain string, outputDir string, saveContent bool, saveRawHTML bool, stateFile string) *Crawler {
@@ -87,6 +93,8 @@ func NewCrawler(concurrency int, delay time.Duration, domain string, outputDir s
 		stateFile:   stateFile,
 		client:      &http.Client{Timeout: 10 * time.Second},
 		pending:     make(map[string]struct{}),
+		depths:      make(map[string]int),
+		depthsMu:    sync.RWMutex{},
 	}
 }
 
@@ -105,6 +113,12 @@ func (c *Crawler) Crawl(startURL string) {
 			fmt.Printf("Error loading state: %v\n", err)
 		}
 	}
+
+	c.depthsMu.Lock()
+	if _, ok := c.depths[startURL]; !ok {
+		c.depths[startURL] = 0
+	}
+	c.depthsMu.Unlock()
 
 	// Add starting url to queue if not already visited
 	c.scheduleURL(startURL)
@@ -134,7 +148,14 @@ func (c *Crawler) worker() {
 }
 
 func (c *Crawler) processPage(pageURL string) {
-	fmt.Printf("Crawling :%s\n", pageURL)
+	c.pagesMu.Lock()
+	pagesCount := len(c.pages)
+	c.pagesMu.Unlock()
+	if c.maxPages > 0 && pagesCount >= c.maxPages {
+		return
+	}
+
+	fmt.Printf("Crawling: %s\n", pageURL)
 
 	// fetch the page with timeout and user-agent
 	req, err := http.NewRequest("GET", pageURL, nil)
@@ -163,12 +184,27 @@ func (c *Crawler) processPage(pageURL string) {
 
 	// Store page data
 	c.pagesMu.Lock()
+	if c.maxPages > 0 && len(c.pages) >= c.maxPages {
+		c.pagesMu.Unlock()
+		return
+	}
 	c.pages = append(c.pages, pageData)
 	c.pagesMu.Unlock()
 
 	// Add new links to the queue
+	c.depthsMu.RLock()
+	parentDepth := c.depths[pageURL]
+	c.depthsMu.RUnlock()
+
 	for _, link := range links {
-		c.scheduleURL(link)
+		if c.maxDepth <= 0 || parentDepth < c.maxDepth {
+			c.depthsMu.Lock()
+			if _, ok := c.depths[link]; !ok {
+				c.depths[link] = parentDepth + 1
+			}
+			c.depthsMu.Unlock()
+			c.scheduleURL(link)
+		}
 	}
 }
 
@@ -335,6 +371,13 @@ func (c *Crawler) scheduleURL(pageURL string) bool {
 		return false
 	}
 
+	c.pagesMu.Lock()
+	pagesCount := len(c.pages)
+	c.pagesMu.Unlock()
+	if c.maxPages > 0 && pagesCount >= c.maxPages {
+		return false
+	}
+
 	c.visitedMu.Lock()
 	if c.visited[pageURL] {
 		c.visitedMu.Unlock()
@@ -485,10 +528,18 @@ func (c *Crawler) saveState() error {
 	}
 	c.visitedMu.RUnlock()
 
+	c.depthsMu.RLock()
+	depthsCopy := make(map[string]int, len(c.depths))
+	for k, v := range c.depths {
+		depthsCopy[k] = v
+	}
+	c.depthsMu.RUnlock()
+
 	state := CrawlState{
 		VisitedURLs: visited,
 		PendingURLs: c.snapshotPending(),
 		Timestamp:   time.Now(),
+		URLDepths:   depthsCopy,
 	}
 
 	file, err := os.Create(c.stateFile)
@@ -527,6 +578,15 @@ func (c *Crawler) loadState() error {
 	}
 	c.visitedMu.Unlock()
 
+	// Restore depths
+	c.depthsMu.Lock()
+	if state.URLDepths != nil {
+		for k, v := range state.URLDepths {
+			c.depths[k] = v
+		}
+	}
+	c.depthsMu.Unlock()
+
 	for _, pageURL := range state.PendingURLs {
 		if pageURL == "" {
 			continue
@@ -545,7 +605,7 @@ func (c *Crawler) loadState() error {
 		c.queue <- pageURL
 	}
 
-	fmt.Printf("Loaded state: %d visited URLs, %d pending URLs\n", len(state.VisitedURLs), len(state.PendingURLs))
+	fmt.Printf("Loaded state: %d visited URLs, %d pending URLs, %d depths mapped\n", len(state.VisitedURLs), len(state.PendingURLs), len(state.URLDepths))
 
 	return nil
 }
@@ -559,7 +619,22 @@ func main() {
 	saveContentFlag := flag.Bool("save-content", true, "Save extracted text content")
 	saveRawHTMLFlag := flag.Bool("save-raw-html", false, "Save raw HTML for each crawled page")
 	stateFileFlag := flag.String("state-file", "./crawl_state.json", "File used to persist crawl state")
+	maxDepthFlag := flag.Int("max-depth", 0, "Maximum depth to crawl (0 for unlimited)")
+	maxPagesFlag := flag.Int("max-pages", 0, "Maximum pages to crawl (0 for unlimited)")
+	interactiveFlag := flag.Bool("interactive", false, "Run in interactive terminal menu mode")
 	flag.Parse()
+
+	isDefaultStart := true
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "start-url" {
+			isDefaultStart = false
+		}
+	})
+
+	if *interactiveFlag || (flag.NArg() == 0 && isDefaultStart) {
+		runInteractiveMenu()
+		return
+	}
 
 	start := *startFlag
 	if args := flag.Args(); len(args) > 0 {
@@ -597,14 +672,21 @@ func main() {
 		saveRawHTML,
 		stateFile,
 	)
+	crawler.maxDepth = *maxDepthFlag
+	crawler.maxPages = *maxPagesFlag
 
 	fmt.Printf("Starting crawl of %s (domain: %s)\n", start, domain)
 	fmt.Printf("Output directory: %s\n", outputDir)
 	fmt.Printf("Save content: %v, Save raw HTML: %v\n", saveContent, saveRawHTML)
-	fmt.Printf("State file: %s\n\n", stateFile)
+	fmt.Printf("State file: %s\n", stateFile)
+	fmt.Printf("Max depth: %d, Max pages: %d\n\n", crawler.maxDepth, crawler.maxPages)
 
 	crawler.Crawl(start)
 
+	finalizeCrawl(crawler, outputDir)
+}
+
+func finalizeCrawl(crawler *Crawler, outputDir string) {
 	// Save state for potential resuming
 	if err := crawler.saveState(); err != nil {
 		fmt.Printf("Error saving state: %v\n", err)
@@ -638,4 +720,185 @@ func main() {
 	fmt.Printf("Failed: %d pages\n", crawler.stats.PagesFailed)
 	fmt.Printf("Duration: %.2f seconds\n", crawler.stats.Duration)
 	fmt.Printf("Queue full events: %d\n", crawler.stats.QueueFullCount)
+}
+
+func runInteractiveMenu() {
+	reader := bufio.NewReader(os.Stdin)
+
+	// Default configuration values
+	startURL := "https://cine-craft-box.lovable.app/"
+	concurrency := 5
+	delay := 100 * time.Millisecond
+	maxDepth := 0
+	maxPages := 0
+	saveContent := true
+	saveRawHTML := false
+	outputDir := "./crawl_output"
+	stateFile := "./crawl_state.json"
+
+	for {
+		depthLimitDesc := ""
+		if maxDepth == 0 {
+			depthLimitDesc = "Unlimited"
+		} else {
+			depthLimitDesc = fmt.Sprintf("Max Depth: %d", maxDepth)
+		}
+
+		pagesLimitDesc := ""
+		if maxPages == 0 {
+			pagesLimitDesc = "Unlimited"
+		} else {
+			pagesLimitDesc = fmt.Sprintf("Max Pages: %d", maxPages)
+		}
+
+		fmt.Println("\n==================================================")
+		fmt.Println("         CONCURRENT WEB CRAWLER TUI MENU")
+		fmt.Println("==================================================")
+		fmt.Printf(" 1. Start URL:         %s\n", startURL)
+		fmt.Printf(" 2. Concurrency:       %d workers\n", concurrency)
+		fmt.Printf(" 3. Request Delay:     %s\n", delay)
+		fmt.Printf(" 4. Max Depth:         %s\n", depthLimitDesc)
+		fmt.Printf(" 5. Max Pages:         %s\n", pagesLimitDesc)
+		fmt.Printf(" 6. Save Text Content: %t\n", saveContent)
+		fmt.Printf(" 7. Save Raw HTML:     %t\n", saveRawHTML)
+		fmt.Printf(" 8. Output Directory:  %s\n", outputDir)
+		fmt.Printf(" 9. State File Path:   %s\n", stateFile)
+		fmt.Println("--------------------------------------------------")
+		fmt.Println(" S. START CRAWLING")
+		fmt.Println(" R. RESUME FROM PREVIOUS STATE")
+		fmt.Println(" E. EXIT")
+		fmt.Println("==================================================")
+		fmt.Print("Select an option (1-9, S, R, E): ")
+
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("Error reading input: %v\n", err)
+			continue
+		}
+		input = strings.TrimSpace(strings.ToUpper(input))
+
+		switch input {
+		case "1":
+			fmt.Print("Enter Start URL: ")
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			if val != "" {
+				startURL = val
+			}
+		case "2":
+			fmt.Print("Enter Concurrency (1-50): ")
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			var n int
+			if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 1 && n <= 50 {
+				concurrency = n
+			} else {
+				fmt.Println("Invalid concurrency. Must be an integer between 1 and 50.")
+			}
+		case "3":
+			fmt.Print("Enter Request Delay (e.g. 100ms, 1s, 500ms): ")
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			if d, err := time.ParseDuration(val); err == nil {
+				delay = d
+			} else {
+				fmt.Println("Invalid duration format. Use e.g. 200ms, 1s.")
+			}
+		case "4":
+			fmt.Print("Enter Max Depth (0 for unlimited): ")
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			var d int
+			if _, err := fmt.Sscanf(val, "%d", &d); err == nil && d >= 0 {
+				maxDepth = d
+			} else {
+				fmt.Println("Invalid max depth.")
+			}
+		case "5":
+			fmt.Print("Enter Max Pages (0 for unlimited): ")
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			var p int
+			if _, err := fmt.Sscanf(val, "%d", &p); err == nil && p >= 0 {
+				maxPages = p
+			} else {
+				fmt.Println("Invalid max pages.")
+			}
+		case "6":
+			saveContent = !saveContent
+			fmt.Printf("Save Text Content set to: %t\n", saveContent)
+		case "7":
+			saveRawHTML = !saveRawHTML
+			fmt.Printf("Save Raw HTML set to: %t\n", saveRawHTML)
+		case "8":
+			fmt.Print("Enter Output Directory: ")
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			if val != "" {
+				outputDir = val
+			}
+		case "9":
+			fmt.Print("Enter State File Path: ")
+			val, _ := reader.ReadString('\n')
+			val = strings.TrimSpace(val)
+			if val != "" {
+				stateFile = val
+			}
+		case "S":
+			startURL = strings.TrimSpace(startURL)
+			startURL = strings.Trim(startURL, "[]")
+			u, err := url.Parse(startURL)
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				fmt.Printf("Invalid start URL: %v. Please set a valid URL first.\n", err)
+				break
+			}
+			domain := strings.ToLower(u.Hostname())
+
+			if err := os.MkdirAll(outputDir, 0755); err != nil {
+				fmt.Printf("Error creating output directory: %v\n", err)
+				break
+			}
+
+			crawler := NewCrawler(concurrency, delay, domain, outputDir, saveContent, saveRawHTML, stateFile)
+			crawler.maxDepth = maxDepth
+			crawler.maxPages = maxPages
+
+			fmt.Println("\nStarting crawl...")
+			fmt.Printf("Target URL: %s\n", startURL)
+			fmt.Println("Press Ctrl+C to stop early.")
+
+			crawler.Crawl(startURL)
+			finalizeCrawl(crawler, outputDir)
+
+		case "R":
+			if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+				fmt.Printf("State file %s does not exist. Cannot resume.\n", stateFile)
+				break
+			}
+			startURL = strings.TrimSpace(startURL)
+			startURL = strings.Trim(startURL, "[]")
+			u, err := url.Parse(startURL)
+			if err != nil || u.Scheme == "" || u.Host == "" {
+				fmt.Printf("Invalid start URL: %v. Please set a valid URL first.\n", err)
+				break
+			}
+			domain := strings.ToLower(u.Hostname())
+
+			crawler := NewCrawler(concurrency, delay, domain, outputDir, saveContent, saveRawHTML, stateFile)
+			crawler.maxDepth = maxDepth
+			crawler.maxPages = maxPages
+
+			fmt.Println("\nResuming crawl from saved state...")
+			fmt.Println("Press Ctrl+C to stop early.")
+
+			crawler.Crawl(startURL)
+			finalizeCrawl(crawler, outputDir)
+
+		case "E":
+			fmt.Println("Exiting crawler. Goodbye!")
+			return
+		default:
+			fmt.Println("Invalid option. Please choose between 1-9, S, R, or E.")
+		}
+	}
 }
